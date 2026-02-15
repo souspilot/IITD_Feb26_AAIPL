@@ -29,20 +29,38 @@ class AnsweringAgent(object):
             "Break down the problem, analyze all options, eliminate distractors, and then confidently select the correct answer. "
             "Always explain your reasoning before finalizing your choice."
         )
-
+        question_in_context=   '''B, D, M, K, P, Q, W and H are sitting around a circle facing at the centre. M is to the immediate right of B who is 4th to the right of K. P is 2nd to the left of B and is 4th to the right of W. Q is 2nd to the right of D who is 2nd to the right of H.\n\n79. Who is 3rd to the right of B?'''
+        choices_in_context = '''
+             [
+          "A) W",
+          "B) M",
+          "C) K",
+          "D) H"
+        ]
+        '''
+        incontext_ans = {
+            "reasoning": "Arrangement (CCW from B): B(1) -> M(2) -> Q(3) -> W(4) -> D(5) -> K(6) -> H(7) -> P(8). Counting 3 positions to the right (CCW) from B(1): 1->2->3->4. The person at position 4 is H.",
+            "answer": "D"
+          }
+        # Escape braces so .format() treats them as literals
+        incontext_ans_str = json.dumps(incontext_ans, indent=4).replace("{", "{{").replace("}", "}}")
         tmpl = (
             "INSTRUCTIONS FOR ANSWERING:\n"
             "1. Carefully read and understand what is being asked.\n"
             "2. Consider why each choice might be correct or incorrect.\n"
             "3. There is only **ONE OPTION** correct.\n"
             "4. Provide reasoning within 100 words\n\n"
+            "Example: Question:\n" +question_in_context+
+            "Choices: \n" + choices_in_context+
+            "Your Output:"+incontext_ans_str+
             "Now answer the following question:\n"
             "Question: {}\n"
             "Choices: {}\n\n"
             "RESPONSE FORMAT: Strictly generate a valid JSON object as shown below:\n"
             "{{\n"
-            '    "answer": "One of the letter from [A, B, C, D]",\n'
-            '    "reasoning": "Brief explanation within 100 words"\n'
+            '    "reasoning": "Brief explanation within 100 words",\n'
+            '    "answer": "One of the letter from [A, B, C, D]"\n'
+            
             "}}"
         )
 
@@ -228,6 +246,7 @@ if __name__ == "__main__":
     )
     ans = []
     for idx, (q, a) in enumerate(zip(sample_questions, answer)):
+        a = a.replace('"explanation"', '"reasoning"')
         if args.verbose:
             print(f"\n=== Question {idx+1} ===")
             print(f"Question: {q.get('question', 'N/A')}")
@@ -235,25 +254,36 @@ if __name__ == "__main__":
             print(f"Model Answer:\n{a}")
         try:
             a = json.loads(a)
-            if all(k in a for k in ["answer", "reasoning"]):
+            if "answer" in a:
                 # ++++++++++++++++++++++++++
                 # TODO: IMPROVE THE FOLLOWING
                 if len(a["answer"]) != 1:
                     a["answer"] = agent.agent.generate_response(
                         option_extractor_prompt(a["answer"], q["choices"])
                     )
+                if "reasoning" not in a:
+                    a["reasoning"] = ""
                 # ++++++++++++++++++++++++++
             else:
                 # the dictionary is not as expected. So extract it using the same model: Self-Reflection
                 prompt = (
                     "Extract **ONLY** the answer and reasoning while discarding the rest.\n\n"
-                    "String:\n"
-                    "{}\n\n"
                     "Given Format:\n"
                     "{{\n"
                     '    "answer": "Only the option letter (A, B, C, or D)",\n'
                     '    "reasoning": "..."\n'
                     "}}"
+                    "Example String:\n"
+                    "Based on the chemical reaction, the temperature increases, suggesting it is exothermic. "
+                    "Therefore, the correct choice is B.\n\n"
+                    "Example Output:\n"
+                    "{\n"
+                    '    "answer": "B",\n'
+                    '    "reasoning": "The temperature increase indicates an exothermic reaction."\n'
+                    "}\n\n"
+                    "String:\n"
+                    "{}\n\n"
+                    "Output:"
                 )
                 a = agent.agent.generate_response(
                     prompt.format(json.dumps(a, indent=4))

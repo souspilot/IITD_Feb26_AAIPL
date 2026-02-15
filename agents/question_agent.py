@@ -4,7 +4,8 @@ from tqdm import tqdm
 from pathlib import Path
 from typing import List, Tuple, Dict, Any
 
-from .question_model import QAgent
+# from .question_model1 import QAgent
+from .question_model_og import QAgent
 # from .question_model_llama import QAgent
 
 import random
@@ -133,6 +134,8 @@ class QuestioningAgent(object):
             )
 
         resp, tl, gt = self.agent.generate_response(prompt, sp, **gen_kwargs)
+        print("Raw model response:")
+        print(resp)
 
         if (
             isinstance(resp, list) and all(isinstance(r, str) for r in resp)

@@ -1,146 +1,148 @@
-# Qwen3-4B in action.
 import time
 import torch
-from typing import Optional, List
-from transformers import AutoModelForCausalLM, AutoTokenizer
+import re
+import json  # Added for pre-validation
+from typing import Optional, List, Union, Tuple
+from unsloth import FastLanguageModel
 
-torch.random.manual_seed(0)
-
+# Set seed for reproducibility
+torch.manual_seed(3407)
 
 class AAgent(object):
     def __init__(self, **kwargs):
-        model_name = "Qwen/Qwen3-4B"
+        # 1. Load Qwen 2.5 14B Instruct using Unsloth
+        # Using local path as per your setup
+        model_name = "hf_models/models--Qwen--Qwen2.5-14B-Instruct/snapshots/cf98f3b3bbb457ad9e2bb7baf9a0125b6b88caa8"
+        # model_name = "hf_models/qwen_cot_merged_14b"
+        max_seq_length = 4096 
+        dtype = None 
+        load_in_4bit = False
 
-        # load the tokenizer and the model
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name, padding_side="left")
-        self.model = AutoModelForCausalLM.from_pretrained(
-            model_name, torch_dtype="auto", device_map="auto"
-        )
+        print(f"Loading model: {model_name}...")
+        try:
+            self.model, self.tokenizer = FastLanguageModel.from_pretrained(
+                model_name = model_name,
+                max_seq_length = max_seq_length,
+                dtype = dtype,
+                load_in_4bit = load_in_4bit,
+            )
+        except Exception as e:
+            print(f"Local load failed: {e}")
+            print("Loading from Unsloth Hub...")
+            self.model, self.tokenizer = FastLanguageModel.from_pretrained(
+                model_name = "unsloth/Qwen2.5-14B-Instruct-bnb-4bit",
+                max_seq_length = max_seq_length,
+                dtype = dtype,
+                load_in_4bit = load_in_4bit,
+            )
+        
+        FastLanguageModel.for_inference(self.model)
+        self.tokenizer.padding_side = "left"
+
+    def _clean_response(self, text: str) -> str:
+        """
+        Helper to remove markdown fences and aggressively extract JSON.
+        Uses Regex to find the first valid JSON object boundaries.
+        """
+        # 1. Basic clean of markdown
+        text = text.replace("```json", "").replace("```", "").strip()
+
+        # 2. Regex Extraction: Look for content between first { and last }
+        # [\s\S]* matches any character including newlines
+        match = re.search(r"\{[\s\S]*\}", text)
+        
+        if match:
+            candidate = match.group(0)
+            # 3. JSON Pre-validation
+            try:
+                # If it parses as valid JSON, return the clean candidate
+                json.loads(candidate)
+                return candidate
+            except json.JSONDecodeError:
+                # If regex found brackets but content isn't valid JSON,
+                # fall back to returning the text (stripped of fences)
+                # so the AnsweringAgent's retry logic can handle it.
+                pass
+        
+        return text
 
     def generate_response(
-        self, message: str | List[str], system_prompt: Optional[str] = None, **kwargs
-    ) -> str:
+        self, 
+        message: Union[str, List[str]], 
+        system_prompt: Optional[str] = None, 
+        **kwargs
+    ) -> Union[str, List[str], Tuple[Union[str, List[str]], int, float]]:
+        
+        # 1. Handle Input (Unify into list)
+        if isinstance(message, str):
+            messages_list = [message]
+        else:
+            messages_list = message
+
         if system_prompt is None:
             system_prompt = "You are a helpful assistant."
-        if isinstance(message, str):
-            message = [message]
-        # Prepare all messages for batch processing
-        all_messages = []
-        for msg in message:
-            messages = [
+
+        # 2. Format Prompts
+        formatted_prompts = []
+        for msg in messages_list:
+            chat = [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": msg},
             ]
-            all_messages.append(messages)
-
-        # convert all messages to text format
-        texts = []
-        for messages in all_messages:
             text = self.tokenizer.apply_chat_template(
-                messages,
+                chat,
                 tokenize=False,
-                add_generation_prompt=True,
-                enable_thinking=False,
+                add_generation_prompt=True
             )
-            texts.append(text)
+            formatted_prompts.append(text)
 
-        # tokenize all texts together with padding
-        model_inputs = self.tokenizer(
-            texts, return_tensors="pt", padding=True, truncation=True
-        ).to(self.model.device)
+        # 3. Tokenize
+        inputs = self.tokenizer(
+            formatted_prompts,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+        ).to("cuda")
 
+        # 4. Generate
         tgps_show_var = kwargs.get("tgps_show", False)
-        # conduct batch text completion
-        if tgps_show_var:
-            start_time = time.time()
-        generated_ids = self.model.generate(
-            **model_inputs,
-            max_new_tokens=kwargs.get("max_new_tokens", 1024),
-            pad_token_id=self.tokenizer.pad_token_id,
-        )
-        if tgps_show_var:
-            generation_time = time.time() - start_time
+        start_time = time.time() if tgps_show_var else 0
 
-        # decode the batch
-        batch_outs = []
-        if tgps_show_var:
-            token_len = 0
-        for i, (input_ids, generated_sequence) in enumerate(
-            zip(model_inputs.input_ids, generated_ids)
-        ):
-            # extract only the newly generated tokens
-            output_ids = generated_sequence[len(input_ids) :].tolist()
+        # Parameters optimized for valid JSON generation
+        # (Defaults kept exactly as requested)
+        max_new_tokens = kwargs.get("max_new_tokens", 512)
+        temperature = kwargs.get("temperature", 0.1) 
+        
+        with torch.no_grad():
+            outputs = self.model.generate(
+                input_ids=inputs.input_ids,
+                attention_mask=inputs.attention_mask,
+                max_new_tokens=max_new_tokens,
+                use_cache=True,
+                temperature=temperature,
+                do_sample=(temperature > 0),
+            )
+        
+        generation_time = time.time() - start_time if tgps_show_var else 0
 
-            # compute total tokens generated
+        # 5. Decode
+        decoded_responses = []
+        token_count = 0
+        input_len = inputs.input_ids.shape[1]
+        generated_tokens = outputs[:, input_len:]
+        
+        for i, token_ids in enumerate(generated_tokens):
             if tgps_show_var:
-                token_len += len(output_ids)
+                token_count += len(token_ids)
+            
+            text = self.tokenizer.decode(token_ids, skip_special_tokens=True).strip()
+            # CLEAN THE MARKDOWN HERE (with improved regex cleaner)
+            text = self._clean_response(text)
+            decoded_responses.append(text)
 
-            # remove thinking content using regex
-            # result = re.sub(r'<think>[\s\S]*?</think>', '', full_result, flags=re.DOTALL).strip()
-            index = (
-                len(output_ids) - output_ids[::-1].index(151668)
-                if 151668 in output_ids
-                else 0
-            )
+        result = decoded_responses[0] if isinstance(message, str) else decoded_responses
 
-            # decode the full result
-            content = self.tokenizer.decode(
-                output_ids[index:], skip_special_tokens=True
-            ).strip("\n")
-            batch_outs.append(content)
         if tgps_show_var:
-            return (
-                batch_outs[0] if len(batch_outs) == 1 else batch_outs,
-                token_len,
-                generation_time,
-            )
-        return batch_outs[0] if len(batch_outs) == 1 else batch_outs, None, None
-
-
-if __name__ == "__main__":
-    # Single message (backward compatible)
-    ans_agent = AAgent()
-    response, tl, gt = ans_agent.generate_response(
-        "Solve: 2x + 5 = 15",
-        system_prompt="You are a math tutor.",
-        tgps_show=True,
-        max_new_tokens=512,
-        temperature=0.1,
-        top_p=0.9,
-        do_sample=True,
-    )
-    print(f"Single response: {response}")
-    print(
-        f"Token length: {tl}, Generation time: {gt:.2f} seconds, Tokens per second: {tl/gt:.2f}"
-    )
-    print("-----------------------------------------------------------")
-
-    # Batch processing (new capability)
-    messages = [
-        "What is the capital of France?",
-        "Explain the theory of relativity.",
-        "What are the main differences between Python and Java?",
-        "What is the significance of the Turing Test in AI?",
-        "What is the capital of Japan?",
-    ]
-    responses, tl, gt = ans_agent.generate_response(
-        messages,
-        max_new_tokens=512,
-        temperature=0.1,
-        top_p=0.9,
-        do_sample=True,
-        tgps_show=True,
-    )
-    print("Responses:")
-    for i, resp in enumerate(responses):
-        print(f"Message {i+1}: {resp}")
-    print(
-        f"Token length: {tl}, Generation time: {gt:.2f} seconds, Tokens per second: {tl/gt:.2f}"
-    )
-    print("-----------------------------------------------------------")
-
-    # Custom parameters
-    response = ans_agent.generate_response(
-        "Write a story", temperature=0.8, max_new_tokens=512
-    )
-    print(f"Custom response: {response}")
+            return result, token_count, generation_time
+        else:
+            return result
